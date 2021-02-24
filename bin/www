@@ -1,0 +1,228 @@
+#!/usr/bin/env node
+
+/**
+ * Module dependencies.
+ */
+
+var app = require('../app');
+var debug = require('debug')('greenapi:server');
+var http = require('http');
+const axios = require('axios');
+
+/**
+ * Get port from environment and store in Express.
+ */
+
+var port = normalizePort(process.env.PORT || '3000');
+app.set('port', port);
+
+/**
+ * Create HTTP server.
+ */
+
+var server = http.createServer(app);
+
+/**
+ * Listen on provided port, on all network interfaces.
+ */
+
+server.listen(port);
+server.on('error', onError);
+server.on('listening', onListening);
+
+/**
+ * Normalize a port into a number, string, or false.
+ */
+
+function normalizePort(val) {
+  var port = parseInt(val, 10);
+
+  if (isNaN(port)) {
+    // named pipe
+    return val;
+  }
+
+  if (port >= 0) {
+    // port number
+    return port;
+  }
+
+  return false;
+}
+
+/**
+ * Event listener for HTTP server "error" event.
+ */
+
+function onError(error) {
+  if (error.syscall !== 'listen') {
+    throw error;
+  }
+
+  var bind = typeof port === 'string'
+    ? 'Pipe ' + port
+    : 'Port ' + port;
+
+  // handle specific listen errors with friendly messages
+  switch (error.code) {
+    case 'EACCES':
+      console.error(bind + ' requires elevated privileges');
+      process.exit(1);
+      break;
+    case 'EADDRINUSE':
+      console.error(bind + ' is already in use');
+      process.exit(1);
+      break;
+    default:
+      throw error;
+  }
+}
+
+/**
+ * Event listener for HTTP server "listening" event.
+ */
+
+function onListening() {
+  var addr = server.address();
+  var bind = typeof addr === 'string'
+    ? 'pipe ' + addr
+    : 'port ' + addr.port;
+  debug('Listening on ' + bind);
+}
+
+const Snapshot = require('../models/snapshot.js');
+
+async function refresh_cache() {
+  let snapshots_cache_count = Number(process.env.SNAPSHOTS_CACHE_COUNT);
+  if (isNaN(snapshots_cache_count)) snapshots_cache_count = 365;
+
+  let snapshots = await Snapshot.find().limit(snapshots_cache_count).sort({dtg: 1}).exec();
+  if (snapshots === undefined || snapshots.length === undefined) {
+    console.error('In www.refresh_cache, unexpected response from snapshots db query');
+    console.error(snaphots);
+    return false;
+  }
+
+  let snapshots_details = [];
+  let snapshots_counts = [];
+
+  for (let i=0 ; i<snapshots.length ; i++) {
+    snapshots_details.push({
+      dtg: snapshots[i].dtg,
+      blocks: snapshots[i].blocks,
+      representatives_online: snapshots[i].representatives_online,
+      peers: snapshots[i].peers
+    });
+    snapshots_counts.push({
+      dtg: snapshots[i].dtg,
+      blocks: snapshots[i].blocks,
+      representatives_online: snapshots[i].representatives_online.length,
+      peers: snapshots[i].peers.length
+    });
+  }
+
+  exports.snapshots_cache.details = snapshots_details;
+  exports.snapshots_cache.counts = snapshots_counts;
+
+  return true;
+}
+exports.snapshots_cache = {};
+
+async function is_snapshot_stale() {
+  // Returns true if most recent snapshot is older than stale
+  let minutes = Number(process.env.IS_STALE_MINUTES);
+  if (isNaN(minutes)) minutes = 1440; // one day
+
+  if (exports.snapshots_cache.counts.length == 0) return true;
+
+  const most_recent_dtg = exports.snapshots_cache.counts[exports.snapshots_cache.counts.length-1].dtg;
+
+  let stale_dtg = new Date();
+  stale_dtg.setTime(stale_dtg.getTime() - minutes*60*1000);
+
+  console.log('Latest snapshot: '+ new Date(most_recent_dtg));
+  console.log('Stale snapshot : '+ stale_dtg);
+
+  
+  if (new Date(most_recent_dtg) > stale_dtg) return false;
+  return true;
+
+}
+
+async function save_snapshot() {
+  let response = undefined;
+
+  // representatives_online
+  response = (await axios.get(process.env.NODE_URL +'?action=representatives_online')).data;
+  if (response === undefined || response.representatives === undefined) {
+    console.error('In www.save_snapshot, representatives_online action did not return as expected');
+    return undefined;
+  }
+  const representatives_online = response.representatives;
+
+  // peers
+  response = (await axios.get(process.env.NODE_URL +'?action=peers')).data;
+  if (response === undefined || response.peers === undefined) {
+    console.error('In www.save_snapshot, peers action did not return as expected');
+    return undefined;
+  }
+  const peers = Object.keys(response.peers);
+
+  // block_count
+  response = (await axios.get(process.env.NODE_URL +'?action=block_count')).data;
+  if (response === undefined || response.count === undefined) {
+    console.error('In www.save_snapshot, block_count action did not return as expected');
+    return undefined;
+  }
+  const block_count = Number(response.count);
+
+  // save to db
+  let snapshot = new Snapshot({
+    dtg: new Date(),
+    representatives_online: representatives_online,
+    peers: peers,
+    blocks: block_count
+  });
+  try {
+
+    await snapshot.save();
+    await refresh_cache();
+    return snapshot;
+    
+  } catch(e) {
+    console.error('In www.save_snapshot, failed to save snapshot to db');
+    console.error(e);
+    console.error(snapshot);
+    return undefined;
+  }
+
+}
+
+async function check_for_stale_snapshot() {
+  const is_stale = await is_snapshot_stale();
+  
+  if (!is_stale) {
+    console.log('Snapshot is not stale');
+    return;
+  }
+  
+  if (is_stale) {
+    console.log('Snapshot is stale');
+    const snapshot = await save_snapshot();
+    console.log(snapshot);
+    return;
+  }
+}
+
+async function start_backend() {
+  let stale_minutes = Number(process.env.CHECK_STALE_MINUTES);
+  if (isNaN(stale_minutes)) stale_minutes = 9;
+
+  // Initiate cache
+  await refresh_cache();
+
+  // Interval for snapshot refresh
+  setInterval(check_for_stale_snapshot, stale_minutes*60*1000);
+  check_for_stale_snapshot();
+}
+start_backend();
